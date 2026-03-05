@@ -8,7 +8,9 @@ cbor_metadata = false
 viaIR = true
 evm_version = "cancun"
 optimizer = true
-optimizer_runs = 20_000
+# Keep runtime code size under EIP-170 (24KB) for ClankerLpLockerFeeConversion.
+# Higher runs can exceed max code size on Base and fail deployment.
+optimizer_runs = 100
 
 
 [fmt]

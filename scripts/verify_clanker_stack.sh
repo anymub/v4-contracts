@@ -8,7 +8,7 @@ V4_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$V4_ROOT"
 
-for v in ETHERSCAN_API_KEY CHAIN_ID OWNER WETH POOL_MANAGER POSITION_MANAGER PERMIT2 UNIVERSAL_ROUTER BLOCK_DELAY; do
+for v in ETHERSCAN_API_KEY CHAIN_ID; do
   require_env "$v"
 done
 
@@ -76,12 +76,63 @@ verify_contract() {
   fi
 }
 
-ALLOWLIST_ARGS="$(cast abi-encode "constructor(address)" "$OWNER")"
-CLANKER_ARGS="$(cast abi-encode "constructor(address)" "$OWNER")"
-FEE_LOCKER_ARGS="$(cast abi-encode "constructor(address)" "$OWNER")"
-LP_LOCKER_ARGS="$(cast abi-encode "constructor(address,address,address,address,address,address,address)" "$OWNER" "$CLANKER_FACTORY" "$CLANKER_FEE_LOCKER" "$POSITION_MANAGER" "$PERMIT2" "$UNIVERSAL_ROUTER" "$POOL_MANAGER")"
-HOOK_ARGS="$(cast abi-encode "constructor(address,address,address,address)" "$POOL_MANAGER" "$CLANKER_FACTORY" "$CLANKER_ALLOWLIST" "$WETH")"
-MEV_ARGS="$(cast abi-encode "constructor(uint256)" "$BLOCK_DELAY")"
+if [[ -n "${CLANKER_ALLOWLIST_CTOR_ARGS:-}" ]]; then
+  ALLOWLIST_ARGS="$CLANKER_ALLOWLIST_CTOR_ARGS"
+  echo "[ctor] ClankerPoolExtensionAllowlist: using constructorArgsHex from deployment file"
+else
+  require_env OWNER
+  ALLOWLIST_ARGS="$(cast abi-encode "constructor(address)" "$OWNER")"
+  echo "[ctor] ClankerPoolExtensionAllowlist: constructor args computed from env"
+fi
+
+if [[ -n "${CLANKER_CTOR_ARGS:-}" ]]; then
+  CLANKER_ARGS="$CLANKER_CTOR_ARGS"
+  echo "[ctor] Clanker: using constructorArgsHex from deployment file"
+else
+  require_env OWNER
+  CLANKER_ARGS="$(cast abi-encode "constructor(address)" "$OWNER")"
+  echo "[ctor] Clanker: constructor args computed from env"
+fi
+
+if [[ -n "${CLANKER_FEE_LOCKER_CTOR_ARGS:-}" ]]; then
+  FEE_LOCKER_ARGS="$CLANKER_FEE_LOCKER_CTOR_ARGS"
+  echo "[ctor] ClankerFeeLocker: using constructorArgsHex from deployment file"
+else
+  require_env OWNER
+  FEE_LOCKER_ARGS="$(cast abi-encode "constructor(address)" "$OWNER")"
+  echo "[ctor] ClankerFeeLocker: constructor args computed from env"
+fi
+
+if [[ -n "${CLANKER_LP_LOCKER_CTOR_ARGS:-}" ]]; then
+  LP_LOCKER_ARGS="$CLANKER_LP_LOCKER_CTOR_ARGS"
+  echo "[ctor] ClankerLpLockerFeeConversion: using constructorArgsHex from deployment file"
+else
+  for v in OWNER POSITION_MANAGER PERMIT2 UNIVERSAL_ROUTER POOL_MANAGER; do
+    require_env "$v"
+  done
+  LP_LOCKER_ARGS="$(cast abi-encode "constructor(address,address,address,address,address,address,address)" "$OWNER" "$CLANKER_FACTORY" "$CLANKER_FEE_LOCKER" "$POSITION_MANAGER" "$PERMIT2" "$UNIVERSAL_ROUTER" "$POOL_MANAGER")"
+  echo "[ctor] ClankerLpLockerFeeConversion: constructor args computed from env"
+fi
+
+if [[ -n "${CLANKER_HOOK_CTOR_ARGS:-}" ]]; then
+  HOOK_ARGS="$CLANKER_HOOK_CTOR_ARGS"
+  echo "[ctor] ClankerHookStaticFeeV2: using constructorArgsHex from deployment file"
+else
+  for v in POOL_MANAGER WETH; do
+    require_env "$v"
+  done
+  HOOK_ARGS="$(cast abi-encode "constructor(address,address,address,address)" "$POOL_MANAGER" "$CLANKER_FACTORY" "$CLANKER_ALLOWLIST" "$WETH")"
+  echo "[ctor] ClankerHookStaticFeeV2: constructor args computed from env"
+fi
+
+if [[ -n "${CLANKER_MEV_CTOR_ARGS:-}" ]]; then
+  MEV_ARGS="$CLANKER_MEV_CTOR_ARGS"
+  echo "[ctor] ClankerMevBlockDelay: using constructorArgsHex from deployment file"
+else
+  require_env BLOCK_DELAY
+  MEV_ARGS="$(cast abi-encode "constructor(uint256)" "$BLOCK_DELAY")"
+  echo "[ctor] ClankerMevBlockDelay: constructor args computed from env"
+fi
 
 verify_contract "ClankerDeployer" "$CLANKER_DEPLOYER_LIB" "src/utils/ClankerDeployer.sol:ClankerDeployer"
 verify_contract "ClankerPoolExtensionAllowlist" "$CLANKER_ALLOWLIST" "src/hooks/ClankerPoolExtensionAllowlist.sol:ClankerPoolExtensionAllowlist" "$ALLOWLIST_ARGS"

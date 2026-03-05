@@ -11,6 +11,10 @@ const HOOK_FLAGS = 0x28ccn; // beforeInit + beforeAddLiquidity + beforeSwap + af
 
 const RETRIES = Number(process.env.DEPLOY_RETRIES || 5);
 const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_SECONDS || 2) * 1000;
+const MAX_RUNTIME_CODE_SIZE_BYTES = 24_576;
+const HOOK_DEPLOY_GAS_LIMIT = BigInt(process.env.HOOK_DEPLOY_GAS_LIMIT || "20000000");
+const HOOK_CODE_WAIT_ATTEMPTS = Number(process.env.HOOK_CODE_WAIT_ATTEMPTS || 25);
+const HOOK_CODE_WAIT_DELAY_MS = Number(process.env.HOOK_CODE_WAIT_DELAY_MS || 1500);
 
 const PROJECT_ROOT = process.env.ROOT_DIR
   ? path.resolve(process.env.ROOT_DIR)
@@ -59,6 +63,78 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sanitizeErrorMessage(message) {
+  if (!message) return "";
+  let out = String(message);
+  out = out.replace(/transaction="0x[0-9a-fA-F]+"/g, 'transaction="<omitted>"');
+  out = out.replace(/data="0x[0-9a-fA-F]+"/g, 'data="<omitted>"');
+  out = out.replace(/\s+/g, " ").trim();
+  if (out.length > 320) {
+    out = `${out.slice(0, 317)}...`;
+  }
+  return out;
+}
+
+function extractNonceHint(message) {
+  const match = /next nonce\s+(\d+),\s*tx nonce\s+(\d+)/i.exec(String(message || ""));
+  if (!match) return null;
+  return {
+    nextNonce: Number(match[1]),
+    txNonce: Number(match[2]),
+  };
+}
+
+function formatRetryError(error) {
+  const topMessage = String(error?.message || error || "");
+  const providerMessage = error?.info?.error?.message || error?.error?.message || "";
+  const bestMessage = sanitizeErrorMessage(providerMessage || topMessage);
+  const nonceHint = extractNonceHint(providerMessage || topMessage);
+  const payload = {
+    code: error?.code || "UNKNOWN",
+    message: bestMessage,
+  };
+  if (nonceHint) {
+    payload.nextNonce = nonceHint.nextNonce;
+    payload.txNonce = nonceHint.txNonce;
+  }
+  return payload;
+}
+
+function isHeaderNotFoundError(error) {
+  const msg = String(error?.message || error?.error?.message || "").toLowerCase();
+  return msg.includes("header not found") || msg.includes("block not found");
+}
+
+function decodeAddressFromReturnData(data) {
+  try {
+    if (!data || data === "0x") return null;
+    if (typeof data !== "string") return null;
+    const hex = data.startsWith("0x") ? data.slice(2) : data;
+    if (hex.length < 64) return null;
+    const last32 = `0x${hex.slice(-64)}`;
+    const addrHex = `0x${last32.slice(-40)}`;
+    return ethers.getAddress(addrHex);
+  } catch {
+    return null;
+  }
+}
+
+function redactRpcUrl(url) {
+  try {
+    const u = new URL(String(url));
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return String(url || "");
+  }
+}
+
+function logDeployStepResult(label, result) {
+  const mode = result?.reused ? "reused" : "deployed";
+  const txHash = result?.txHash || "n/a";
+  const addr = result?.address || "<missing>";
+  console.log(`[ok] ${label} ${mode} | address=${addr} | txHash=${txHash}`);
+}
+
 function nowTs() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
@@ -71,23 +147,71 @@ function loadArtifact(name) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function ensureArtifacts() {
-  const missing = Object.values(ARTIFACTS).filter((f) => !fs.existsSync(f));
-  if (missing.length === 0) {
-    return;
-  }
+function isTruthy(v) {
+  return !["0", "false", "no", "off"].includes(String(v || "").toLowerCase());
+}
 
-  console.log("[preflight] Missing artifacts, running forge build in v4-contracts");
-  execSync("forge build", {
-    cwd: V4_ROOT,
-    stdio: "inherit",
-    env: process.env,
-  });
+function ensureArtifacts() {
+  const forceRebuild = isTruthy(process.env.DEPLOY_FORCE_REBUILD ?? "false");
+
+  if (forceRebuild) {
+    console.log("[preflight] Running forge clean + forge build in v4-contracts");
+    execSync("forge clean", {
+      cwd: V4_ROOT,
+      stdio: "inherit",
+      env: process.env,
+    });
+    execSync("forge build", {
+      cwd: V4_ROOT,
+      stdio: "inherit",
+      env: process.env,
+    });
+  } else {
+    const missing = Object.values(ARTIFACTS).filter((f) => !fs.existsSync(f));
+    if (missing.length > 0) {
+      console.log("[preflight] Missing artifacts, running forge build in v4-contracts");
+      execSync("forge build", {
+        cwd: V4_ROOT,
+        stdio: "inherit",
+        env: process.env,
+      });
+    }
+  }
 
   const stillMissing = Object.values(ARTIFACTS).filter((f) => !fs.existsSync(f));
   if (stillMissing.length > 0) {
     throw new Error(`Artifacts still missing after forge build: ${stillMissing.join(", ")}`);
   }
+}
+
+function deployedBytecodeSizeBytes(artifact) {
+  const raw = artifact?.deployedBytecode?.object || "";
+  if (!raw || raw === "0x") return 0;
+  const hex = raw.startsWith("0x") ? raw.slice(2) : raw;
+  if (!hex) return 0;
+  return Math.floor(hex.length / 2);
+}
+
+function preflightRuntimeCodeSizeCheck() {
+  const oversize = [];
+  for (const [name, artifactFile] of Object.entries(ARTIFACTS)) {
+    if (!fs.existsSync(artifactFile)) continue;
+    const artifact = loadArtifact(name);
+    const sizeBytes = deployedBytecodeSizeBytes(artifact);
+    if (sizeBytes > MAX_RUNTIME_CODE_SIZE_BYTES) {
+      oversize.push({ name, sizeBytes });
+    }
+  }
+
+  if (oversize.length === 0) return;
+
+  const details = oversize
+    .map((x) => `${x.name}=${x.sizeBytes} bytes (> ${MAX_RUNTIME_CODE_SIZE_BYTES})`)
+    .join(", ");
+  throw new Error(
+    `Preflight failed: runtime code size exceeds EIP-170 limit. ${details}. ` +
+      "Reduce bytecode size (e.g. lower optimizer_runs or refactor) before deploying."
+  );
 }
 
 function linkBytecode(bytecodeObject, linkReferences, libraries) {
@@ -134,11 +258,13 @@ function isRetryableError(error) {
   );
 }
 
-async function sendWithRetry(label, sendTx) {
+async function sendWithRetry(label, sendTx, nonceSigner = null) {
   let attempt = 0;
   for (;;) {
     attempt += 1;
     try {
+      // Do not reset nonce cache before first send attempt. On some public RPCs,
+      // querying nonce immediately after a previous tx can lag and return stale values.
       const tx = await sendTx();
       const rc = await tx.wait();
       if (!rc || Number(rc.status) !== 1) {
@@ -149,8 +275,18 @@ async function sendWithRetry(label, sendTx) {
       if (!isRetryableError(error) || attempt >= RETRIES) {
         throw error;
       }
+      // NonceManager caches nonce locally. When another process/account action
+      // consumed nonce in parallel, reset before retry to refetch pending nonce.
+      if (nonceSigner && typeof nonceSigner.reset === "function") {
+        try {
+          nonceSigner.reset();
+        } catch {
+          // best effort
+        }
+      }
+      const err = formatRetryError(error);
       console.warn(
-        `Retryable tx error for ${label} (attempt ${attempt}/${RETRIES}): ${String(error?.message || error)}`
+        `Retryable tx error for ${label} (attempt ${attempt}/${RETRIES}): ${JSON.stringify(err)}`
       );
       await sleep(RETRY_DELAY_MS);
     }
@@ -173,6 +309,7 @@ async function deployContract({ name, signer, provider, args = [], libraries = {
   for (;;) {
     attempt += 1;
     try {
+      // Same rationale as sendWithRetry: avoid pre-send reset on first attempt.
       const contract = await factory.deploy(...args);
       const deployTx = contract.deploymentTransaction();
       if (!deployTx) {
@@ -188,8 +325,16 @@ async function deployContract({ name, signer, provider, args = [], libraries = {
       if (!isRetryableError(error) || attempt >= RETRIES) {
         throw error;
       }
+      if (signer && typeof signer.reset === "function") {
+        try {
+          signer.reset();
+        } catch {
+          // best effort
+        }
+      }
+      const err = formatRetryError(error);
       console.warn(
-        `Retryable deploy error for ${name} (attempt ${attempt}/${RETRIES}): ${String(error?.message || error)}`
+        `Retryable deploy error for ${name} (attempt ${attempt}/${RETRIES}): ${JSON.stringify(err)}`
       );
       await sleep(RETRY_DELAY_MS);
     }
@@ -243,13 +388,59 @@ async function deployHookCreate2({ signer, provider, args, existingAddress }) {
   }
 
   const data = ethers.concat([saltHex, initCode]);
-  const { txHash } = await sendWithRetry("deployHookStaticFeeV2(create2)", () =>
-    signer.sendTransaction({ to: CREATE2_DEPLOYER, data, gasLimit: 12_000_000n })
+  // Preflight static call: helps diagnose constructor/deployer failures before sending tx.
+  let preflightAddress = null;
+  try {
+    const preflight = await provider.call({ to: CREATE2_DEPLOYER, data });
+    preflightAddress = decodeAddressFromReturnData(preflight);
+    if (preflightAddress && preflightAddress.toLowerCase() !== predicted.toLowerCase()) {
+      throw new Error(
+        `CREATE2 preflight address mismatch: predicted=${predicted}, preflight=${preflightAddress}`
+      );
+    }
+  } catch (error) {
+    const err = formatRetryError(error);
+    throw new Error(`CREATE2 preflight failed for hook deployment: ${JSON.stringify(err)}`);
+  }
+
+  const { txHash, receipt } = await sendWithRetry(
+    "deployHookStaticFeeV2(create2)",
+    () => signer.sendTransaction({ to: CREATE2_DEPLOYER, data, gasLimit: HOOK_DEPLOY_GAS_LIMIT }),
+    signer
   );
 
-  const code = await provider.getCode(predicted);
+  let code = "0x";
+  if (receipt?.blockNumber != null) {
+    try {
+      code = await provider.getCode(predicted, receipt.blockNumber);
+    } catch (error) {
+      if (isHeaderNotFoundError(error)) {
+        console.warn(
+          `[hook] getCode by block ${receipt.blockNumber} not ready on RPC (block/header not found), falling back to latest polling`
+        );
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  for (let i = 0; (!code || code === "0x") && i < HOOK_CODE_WAIT_ATTEMPTS; i += 1) {
+    await sleep(HOOK_CODE_WAIT_DELAY_MS);
+    try {
+      code = await provider.getCode(predicted);
+    } catch (error) {
+      if (isHeaderNotFoundError(error)) {
+        continue;
+      }
+      throw error;
+    }
+  }
   if (!code || code === "0x") {
-    throw new Error(`Hook deployment failed, no code at predicted address ${predicted}`);
+    throw new Error(
+      `Hook deployment failed, no code at predicted address ${predicted}. ` +
+        `txHash=${txHash}, status=${receipt?.status ?? "unknown"}, block=${receipt?.blockNumber ?? "unknown"}, ` +
+        `gasUsed=${receipt?.gasUsed?.toString?.() ?? "unknown"}`
+    );
   }
 
   return { address: predicted, txHash, reused: false, mined: true };
@@ -261,6 +452,7 @@ function abiEncode(types, values) {
 
 async function main() {
   ensureArtifacts();
+  preflightRuntimeCodeSizeCheck();
 
   const rpcUrl = req("RPC_URL");
   const privateKey = req("PRIVATE_KEY");
@@ -276,8 +468,10 @@ async function main() {
   const envName = process.env.ENV_NAME || process.env.NETWORK_NAME || "unknown";
 
   const provider = new ethers.JsonRpcProvider(rpcUrl);
-  const signer = new ethers.Wallet(privateKey, provider);
+  const signer = new ethers.NonceManager(new ethers.Wallet(privateKey, provider));
+  const deployerAddress = await signer.getAddress();
   const network = await provider.getNetwork();
+  console.log(`[preflight] rpc url=${redactRpcUrl(rpcUrl)}`);
 
   if (process.env.CHAIN_ID && Number(process.env.CHAIN_ID) !== Number(network.chainId)) {
     throw new Error(
@@ -285,14 +479,66 @@ async function main() {
     );
   }
 
+  // Nonce health check for troubleshooting: if pending > latest, there are outstanding txs
+  // from this deployer that can cause frequent NONCE_EXPIRED on first attempt.
+  const latestNonce = await provider.getTransactionCount(deployerAddress, "latest");
+  const pendingNonce = await provider.getTransactionCount(deployerAddress, "pending");
+  console.log(
+    `[preflight] nonce state deployer=${deployerAddress} latest=${latestNonce} pending=${pendingNonce}`
+  );
+  if (pendingNonce > latestNonce) {
+    console.warn(
+      `[preflight] Deployer has ${pendingNonce - latestNonce} pending tx(s). ` +
+        "This can cause nonce-too-low retries until pending state converges."
+    );
+  }
+
   fs.mkdirSync(DEPLOYMENTS_DIR, { recursive: true });
   const latestFile = path.join(DEPLOYMENTS_DIR, `${envName}-latest.json`);
+  const inProgressFile = path.join(DEPLOYMENTS_DIR, `${envName}-in-progress.json`);
   const latest = fs.existsSync(latestFile) ? JSON.parse(fs.readFileSync(latestFile, "utf8")) : null;
+  const inProgress = fs.existsSync(inProgressFile)
+    ? JSON.parse(fs.readFileSync(inProgressFile, "utf8"))
+    : null;
 
-  const existingContracts = latest?.contracts || {};
+  let resumable = null;
+  if (inProgress && Number(inProgress.chainId) === Number(network.chainId) && inProgress.network === envName) {
+    resumable = inProgress;
+    console.log(
+      `[preflight] resume checkpoint detected: stage=${inProgress.stage || "unknown"} file=${inProgressFile}`
+    );
+  } else if (inProgress) {
+    console.warn(
+      `[preflight] ignoring incompatible checkpoint file ${inProgressFile} (network/chain mismatch)`
+    );
+  }
 
-  const txHashes = {};
-  const contracts = {};
+  const existingContracts = {
+    ...(latest?.contracts || {}),
+    ...(resumable?.contracts || {}),
+  };
+
+  const txHashes = {
+    ...(latest?.txHashes || {}),
+    ...(resumable?.txHashes || {}),
+  };
+  const contracts = {
+    ...(latest?.contracts || {}),
+    ...(resumable?.contracts || {}),
+  };
+
+  const persistCheckpoint = (stage) => {
+    const checkpoint = {
+      network: envName,
+      chainId: Number(network.chainId),
+      timestamp: new Date().toISOString(),
+      deployer: deployerAddress,
+      stage,
+      contracts,
+      txHashes,
+    };
+    fs.writeFileSync(inProgressFile, `${JSON.stringify(checkpoint, null, 2)}\n`);
+  };
 
   console.log("[0/7] Deploy ClankerDeployer (library)");
   {
@@ -304,6 +550,8 @@ async function main() {
     });
     contracts.ClankerDeployer = result.address;
     txHashes.ClankerDeployer = result.txHash;
+    logDeployStepResult("ClankerDeployer", result);
+    persistCheckpoint("0/7 ClankerDeployer");
   }
 
   console.log("[1/7] Deploy ClankerPoolExtensionAllowlist");
@@ -317,6 +565,8 @@ async function main() {
     });
     contracts.ClankerPoolExtensionAllowlist = result.address;
     txHashes.ClankerPoolExtensionAllowlist = result.txHash;
+    logDeployStepResult("ClankerPoolExtensionAllowlist", result);
+    persistCheckpoint("1/7 ClankerPoolExtensionAllowlist");
   }
 
   console.log("[2/7] Deploy Clanker");
@@ -333,6 +583,8 @@ async function main() {
     });
     contracts.Clanker = result.address;
     txHashes.Clanker = result.txHash;
+    logDeployStepResult("Clanker", result);
+    persistCheckpoint("2/7 Clanker");
   }
 
   console.log("[3/7] Deploy ClankerFeeLocker");
@@ -346,6 +598,8 @@ async function main() {
     });
     contracts.ClankerFeeLocker = result.address;
     txHashes.ClankerFeeLocker = result.txHash;
+    logDeployStepResult("ClankerFeeLocker", result);
+    persistCheckpoint("3/7 ClankerFeeLocker");
   }
 
   console.log("[4/7] Deploy ClankerLpLockerFeeConversion");
@@ -367,6 +621,8 @@ async function main() {
     });
     contracts.ClankerLpLockerFeeConversion = result.address;
     txHashes.ClankerLpLockerFeeConversion = result.txHash;
+    logDeployStepResult("ClankerLpLockerFeeConversion", result);
+    persistCheckpoint("4/7 ClankerLpLockerFeeConversion");
   }
 
   console.log("[5/7] Deploy ClankerHookStaticFeeV2 (mined CREATE2 address)");
@@ -379,6 +635,8 @@ async function main() {
     });
     contracts.ClankerHookStaticFeeV2 = result.address;
     txHashes.ClankerHookStaticFeeV2 = result.txHash;
+    logDeployStepResult("ClankerHookStaticFeeV2", result);
+    persistCheckpoint("5/7 ClankerHookStaticFeeV2");
   }
 
   console.log("[6/7] Deploy ClankerMevBlockDelay");
@@ -392,6 +650,8 @@ async function main() {
     });
     contracts.ClankerMevBlockDelay = result.address;
     txHashes.ClankerMevBlockDelay = result.txHash;
+    logDeployStepResult("ClankerMevBlockDelay", result);
+    persistCheckpoint("6/7 ClankerMevBlockDelay");
   }
 
   const clankerArtifact = loadArtifact("Clanker");
@@ -405,14 +665,14 @@ async function main() {
     if (ethers.getAddress(currentTeamFeeRecipient) !== teamFeeRecipient) {
       const { txHash } = await sendWithRetry("setTeamFeeRecipient(address)", () =>
         clanker.setTeamFeeRecipient(teamFeeRecipient)
-      );
+      , signer);
       txHashes.setTeamFeeRecipient = txHash;
     }
 
     {
       const { txHash } = await sendWithRetry("setHook(address,bool)", () =>
         clanker.setHook(contracts.ClankerHookStaticFeeV2, true)
-      );
+      , signer);
       txHashes.setHook = txHash;
     }
 
@@ -423,14 +683,14 @@ async function main() {
     if (!lockerEnabled) {
       const { txHash } = await sendWithRetry("setLocker(address,address,bool)", () =>
         clanker.setLocker(contracts.ClankerLpLockerFeeConversion, contracts.ClankerHookStaticFeeV2, true)
-      );
+      , signer);
       txHashes.setLocker = txHash;
     }
 
     {
       const { txHash } = await sendWithRetry("setMevModule(address,bool)", () =>
         clanker.setMevModule(contracts.ClankerMevBlockDelay, true)
-      );
+      , signer);
       txHashes.setMevModule = txHash;
     }
 
@@ -438,13 +698,17 @@ async function main() {
     if (!hasDepositor) {
       const { txHash } = await sendWithRetry("addDepositor(address)", () =>
         feeLocker.addDepositor(contracts.ClankerLpLockerFeeConversion)
-      );
+      , signer);
       txHashes.addDepositor = txHash;
     }
 
     const deprecated = await clanker.deprecated();
     if (deprecated) {
-      const { txHash } = await sendWithRetry("setDeprecated(bool)", () => clanker.setDeprecated(false));
+      const { txHash } = await sendWithRetry(
+        "setDeprecated(bool)",
+        () => clanker.setDeprecated(false),
+        signer
+      );
       txHashes.setDeprecated = txHash;
     }
   }
@@ -479,7 +743,7 @@ async function main() {
     network: envName,
     chainId: Number(network.chainId),
     timestamp: new Date().toISOString(),
-    deployer: signer.address,
+    deployer: deployerAddress,
     contracts,
     constructorArgsHex: {
       ClankerDeployer: "0x",
@@ -510,6 +774,9 @@ async function main() {
   const versionedFile = path.join(DEPLOYMENTS_DIR, `${envName}-${nowTs()}.json`);
   fs.writeFileSync(versionedFile, `${JSON.stringify(deployment, null, 2)}\n`);
   fs.writeFileSync(latestFile, `${JSON.stringify(deployment, null, 2)}\n`);
+  if (fs.existsSync(inProgressFile)) {
+    fs.rmSync(inProgressFile);
+  }
 
   console.log("Done");
   console.log(`- ${versionedFile}`);
